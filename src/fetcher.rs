@@ -63,10 +63,10 @@ pub trait Fetcher: Send + Sync + 'static {
 	/// # async fn main() {
 	/// # type Todo = u32;
 	/// # let hook = swr::hook::MockHook::default();
-	/// let swr = swr::new_in(Fetcher, swr::TokioRuntime, hook);
+	/// let swr = swr::new_in(Fetcher, swr::runtime::Tokio, hook);
 	///
 	/// # loop {
-	/// let result = swr.fetch::<u32, _>("/answer");
+	/// let result = swr.get::<u32, _>("/answer");
 	/// # if result.loading { continue; }
 	/// let response = result.data.unwrap();
 	/// assert_eq!(**response, 42);
@@ -154,10 +154,10 @@ pub trait Fetcher: Send + Sync + 'static {
 	/// # async fn main() {
 	/// # type Todo = u32;
 	/// # let hook = swr::hook::MockHook::default();
-	/// let swr = swr::new_in(Fetcher, swr::TokioRuntime, hook);
+	/// let swr = swr::new_in(Fetcher, swr::runtime::Tokio, hook);
 	///
-	/// let string_key_res = swr.fetch::<Todo, _>("/todos/1");
-	/// let custom_key_res = swr.fetch::<Vec<Todo>, _>(&CustomKey::new("/todos").query("sort", "asc"));
+	/// let string_key_res = swr.get::<Todo, _>("/todos/1");
+	/// let custom_key_res = swr.get::<Vec<Todo>, _>(&CustomKey::new("/todos").query("sort", "asc"));
 	/// # }
 	/// ```
 	///
