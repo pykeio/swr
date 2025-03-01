@@ -1,0 +1,59 @@
+[package]
+name = "stale-while-revalidate"
+description = "Data fetching for immediate-mode GUIs"
+version = "0.0.0"
+edition = "2021"
+rust-version = "1.82"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/pykeio/swr"
+authors = [ "Carson M. <carson@pyke.io>" ]
+categories = [ "caching", "gui" ]
+
+[lib]
+name = "swr"
+
+[dependencies]
+serde = { version = "1.0", default-features = false }
+cfg-if = "1.0"
+slotmap = "1.0"
+parking_lot = { version = "0.12", default-features = false }
+
+smol = { version = "2", optional = true }
+tokio = { version = "1", optional = true, default-features = false, features = [ "time", "rt" ] }
+egui = { version = "0.31", optional = true, default-features = false }
+tracing = { version = "0.1", optional = true, default-features = false }
+
+[features]
+default = [ "tokio", "tracing" ]
+
+smol = [ "dep:smol" ]
+tokio = [ "dep:tokio" ]
+egui = [ "dep:egui" ]
+tracing = [ "dep:tracing" ]
+
+[dev-dependencies]
+egui = { version = "0.31.0", default-features = false }
+serde = { version = "1.0", features = [ "derive" ] }
+eframe = "0.31.0"
+reqwest = { version = "0.12", features = [ "json" ] }
+serde_json = "1.0"
+rmp-serde = "1"
+tokio = { version = "1", features = [ "full", "test-util" ] }
+tracing-subscriber = { version = "0.3", features = [ "fmt", "env-filter" ] }
+
+[package.metadata.docs.rs]
+features = [ "egui", "tokio", "smol" ]
+rustdoc-args = [ "--cfg", "docsrs" ]
+
+[[example]]
+name = "complex-key"
+required-features = [ "tokio", "egui" ]
+[[example]]
+name = "search"
+required-features = [ "tokio", "egui" ]
+[[example]]
+name = "simple"
+required-features = [ "tokio", "egui" ]
+[[example]]
+name = "smol"
+required-features = [ "smol", "egui" ]
