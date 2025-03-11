@@ -65,7 +65,7 @@ pub mod runtime;
 pub(crate) mod util;
 
 use self::{
-	cache::{Cache, CacheSlot},
+	cache::{Cache, CacheEntryStatus, CacheSlot},
 	revalidate::RevalidateIntent,
 	runtime::{DefaultRuntime, RuntimeDefault}
 };
@@ -95,16 +95,16 @@ impl<F: Fetcher, R: Runtime> SWRInner<F, R> {
 		}
 	}
 
-	pub fn revalidate(&self, slot: CacheSlot<F>) {
+	pub(crate) fn revalidate(&self, slot: CacheSlot) {
 		let states = self.cache.states();
 		let Some(state) = states.get(slot) else {
 			return;
 		};
-		state.revalidate_intent.add(RevalidateIntent::MANUALLY_TRIGGERED);
+		state.revalidate_intent().add(RevalidateIntent::MANUALLY_TRIGGERED);
 		self.hook.request_redraw();
 	}
 
-	pub fn mutate<T>(&self, slot: CacheSlot<F>, data: Arc<F::Response<T>>)
+	pub(crate) fn mutate<T>(&self, slot: CacheSlot, data: Arc<F::Response<T>>)
 	where
 		T: Send + Sync + 'static
 	{
@@ -115,11 +115,11 @@ impl<F: Fetcher, R: Runtime> SWRInner<F, R> {
 		});
 	}
 
-	pub fn mutate_with<T, U, M, E, Fut>(
+	pub(crate) fn mutate_with<T, U, M, E, Fut>(
 		self: &Arc<Self>,
-		slot: CacheSlot<F>,
+		slot: CacheSlot,
 		data: Option<Arc<F::Response<T>>>,
-		options: MutateOptions<F, T, U>,
+		options: MutateOptions<F::Response<T>, U>,
 		mutator: M
 	) -> R::Task<std::result::Result<U, E>>
 	where
@@ -135,7 +135,7 @@ impl<F: Fetcher, R: Runtime> SWRInner<F, R> {
 				let mut states = inner.cache.states();
 				states
 					.mutate(slot, |state| {
-						let old_data = state.swap(optimistic_data);
+						let old_data = state.insert(optimistic_data);
 						inner.hook.request_redraw();
 						old_data
 					})
@@ -155,7 +155,7 @@ impl<F: Fetcher, R: Runtime> SWRInner<F, R> {
 					if let Ok(data) = &res {
 						state.insert((options.populator)(data));
 						if options.revalidate {
-							state.revalidate_intent.add(RevalidateIntent::MUTATE);
+							state.revalidate_intent().add(RevalidateIntent::MUTATE);
 						}
 					} else if options.rollback_on_error {
 						if let Some(previous_data) = previous_data {
@@ -192,6 +192,7 @@ impl<F: Fetcher, R: Runtime> SWR<F, R> {
 	///
 	/// To use this constructor, the [`Runtime`] (`R`) must implement [`Default`], which is the case if using SWR's
 	/// [default runtime][crate#runtimes] (i.e. not specifying `R`).
+	#[inline]
 	pub fn new<H: Hook + 'static>(fetcher: F, hook: H) -> Self
 	where
 		R: RuntimeDefault
@@ -207,33 +208,34 @@ impl<F: Fetcher, R: Runtime> SWR<F, R> {
 			let weak_inner = Arc::downgrade(&inner);
 			inner.hook.register_end_frame_cb(Box::new(move || {
 				if let Some(inner) = weak_inner.upgrade() {
-					let mut key_to_slot = inner.cache.key_to_slot.write();
-					let mut states = inner.cache.states();
-					states.retain(|_, state| {
-						let used = state.used_this_pass.swap(false, Ordering::AcqRel);
+					inner.cache.retain(|_, state| {
+						let status = state.status();
+						let used = status.clear(CacheEntryStatus::USED_THIS_PASS, Ordering::AcqRel);
 						if !used {
-							let was_alive = state.alive.swap(false, Ordering::AcqRel);
-							if !was_alive
-								&& state.persisted_instances.load(Ordering::Acquire) == 0
-								&& state.last_draw_time.load(Ordering::Relaxed).elapsed() >= { state.options.read().garbage_collect_timeout }
-							{
-								#[cfg(feature = "tracing")]
-								{
-									tracing::info!(key = ?state.key, "clearing entry because it exceeded GC timeout");
+							let was_alive = status.clear(CacheEntryStatus::ALIVE, Ordering::AcqRel);
+							if !was_alive && state.strong_count.load(Ordering::Acquire) == 0 {
+								let should_gc = match state.options.read().garbage_collect_timeout() {
+									Some(timeout) => state.last_draw_time(Ordering::Relaxed).elapsed() >= timeout,
+									None => false
+								};
+								if should_gc {
+									#[cfg(feature = "tracing")]
+									{
+										tracing::info!(key = ?state.key(), "clearing entry because it exceeded GC timeout");
+									}
+
+									state.fetch_task.abort();
+									state.refresh_task.abort();
+									state.retry_task.abort();
+
+									return false;
 								}
-
-								state.fetch_task.abort();
-								state.refresh_task.abort();
-								state.retry_task.abort();
-
-								key_to_slot.remove(&state.key);
-								return false;
 							}
 						} else {
-							state.alive.store(true, Ordering::Release);
+							status.set(CacheEntryStatus::ALIVE, Ordering::Release);
 						}
 						true
-					});
+					})
 				}
 			}));
 		}
@@ -247,7 +249,7 @@ impl<F: Fetcher, R: Runtime> SWR<F, R> {
 	/// immediate-style [`SWR::get`] functions.
 	///
 	/// The cache entry's `options` will be [merged][Options#merging-behavior] if the key already exists in the cache.
-	pub fn persisted<T, K>(&self, key: &K, options: Options<T, F>) -> Persisted<T, F, R>
+	pub fn persisted<T, K>(&self, key: &K, options: Options<F::Response<T>>) -> Persisted<T, F, R>
 	where
 		T: DeserializeOwned + Send + Sync + 'static,
 		K: Hash + Eq + ?Sized,
@@ -285,7 +287,7 @@ impl<F: Fetcher, R: Runtime> SWR<F, R> {
 	/// This function is equivalent to creating a persisted entry and immediately discarding it on each render and thus
 	/// performs more computation than necessary. If performance is a concern, you should use [`SWR::persisted`]
 	/// instead.
-	pub fn get_with<T, K>(&self, key: &K, options: Options<T, F>) -> Result<T, F, R>
+	pub fn get_with<T, K>(&self, key: &K, options: Options<F::Response<T>>) -> Result<T, F, R>
 	where
 		T: DeserializeOwned + Send + Sync + 'static,
 		K: Hash + Eq + ?Sized,
@@ -343,7 +345,12 @@ impl<F: Fetcher, R: Runtime> SWR<F, R> {
 	/// `Task`][`runtime::Task`] which may be awaited on (depending on the exact choice of [`Runtime`]).
 	///
 	/// [`MutateOptions`] also allows for more control over how the mutation occurs.
-	pub fn mutate_with<T, U, K, M, E, Fut>(self: &Arc<Self>, key: &K, options: MutateOptions<F, T, U>, mutator: M) -> R::Task<std::result::Result<U, E>>
+	pub fn mutate_with<T, U, K, M, E, Fut>(
+		self: &Arc<Self>,
+		key: &K,
+		options: MutateOptions<F::Response<T>, U>,
+		mutator: M
+	) -> R::Task<std::result::Result<U, E>>
 	where
 		T: Send + Sync + 'static,
 		U: Send,
@@ -368,11 +375,13 @@ impl<F: Fetcher, R: Runtime> SWR<F, R> {
 ///
 /// To use this constructor, the [`Runtime`] (`R`) must implement [`Default`], which is the case if using SWR's
 /// [default runtime][crate#runtimes] (i.e. not specifying `R`).
+#[inline(always)]
 pub fn new<F: Fetcher, R: Runtime + RuntimeDefault, H: Hook + 'static>(fetcher: F, hook: H) -> SWR<F, R> {
 	SWR::new(fetcher, hook)
 }
 
 /// Creates a new SWR cache using a non-default [`Runtime`].
+#[inline(always)]
 pub fn new_in<F: Fetcher, R: Runtime, H: Hook + 'static>(fetcher: F, runtime: R, hook: H) -> SWR<F, R> {
 	SWR::new_in(fetcher, runtime, hook)
 }

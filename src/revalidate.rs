@@ -1,5 +1,5 @@
 use std::{
-	num::NonZeroU32,
+	num::NonZeroU8,
 	sync::{
 		Arc,
 		atomic::{AtomicU8, Ordering}
@@ -12,11 +12,12 @@ use serde::de::DeserializeOwned;
 #[cfg(feature = "tracing")]
 use crate::util::Instant;
 use crate::{
-	SWRInner,
+	CacheEntryStatus, SWRInner,
 	cache::{CacheEntry, CacheSlot},
 	fetcher::Fetcher,
+	options::RevalidateFlags,
 	runtime::Runtime,
-	util::{TaskStartMode, throttle}
+	util::{AtomicBitwise, TaskStartMode, throttle}
 };
 
 #[derive(Default)]
@@ -33,7 +34,7 @@ impl RevalidateIntent {
 	pub const MUTATE: u8 = 1 << 6;
 
 	pub fn add(&self, flag: u8) -> bool {
-		self.0.fetch_or(flag, Ordering::AcqRel) & flag != 0
+		self.0.bits_set(flag, Ordering::AcqRel)
 	}
 
 	pub fn take(&self) -> u8 {
@@ -68,14 +69,14 @@ impl RevalidateIntent {
 	}
 }
 
-pub fn launch_fetch<T, F, R>(entry: &mut CacheEntry<F, R>, inner: &Arc<SWRInner<F, R>>, slot: CacheSlot<F>, mode: TaskStartMode, intent: u8)
+pub fn launch_fetch<T, F, R>(entry: &mut CacheEntry<F, R>, inner: &Arc<SWRInner<F, R>>, slot: CacheSlot, mode: TaskStartMode, intent: u8)
 where
 	T: DeserializeOwned + Send + Sync + 'static,
 	F: Fetcher,
 	R: Runtime
 {
 	let inner = Arc::clone(inner);
-	let key = entry.key.clone();
+	let key = entry.key().clone();
 	let did_launch = entry.fetch_task.insert(mode, async move {
 		#[cfg(feature = "tracing")]
 		{
@@ -97,9 +98,8 @@ where
 
 					state.insert(Arc::new(data));
 
-					let options = state.options.read();
-					if let Some(refresh_interval) = options.refresh_interval {
-						drop(options);
+					let refresh_interval = { state.options.read().refresh_interval() };
+					if let Some(refresh_interval) = refresh_interval {
 						launch_refresh::<T, F, R>(state, &inner, slot, refresh_interval);
 					}
 				}
@@ -113,8 +113,8 @@ where
 
 					let retry_count = state.retry_count.fetch_add(1, Ordering::AcqRel);
 					let options = state.options.read();
-					if let Some(retry_interval) = options.error_retry_interval {
-						let max_count = options.error_retry_count.map_or(0, NonZeroU32::get);
+					if let Some(retry_interval) = options.error_retry_interval() {
+						let max_count = options.error_retry_count.map_or(0, NonZeroU8::get);
 						if max_count == 0 || retry_count < max_count {
 							drop(options);
 							launch_retry::<T, F, R>(state, &inner, slot, retry_interval);
@@ -126,15 +126,16 @@ where
 		});
 	});
 	if did_launch {
-		if entry.has_data() {
-			entry.validating = true;
+		let status = entry.status();
+		if status.get(CacheEntryStatus::HAS_DATA, Ordering::Relaxed) {
+			status.set(CacheEntryStatus::VALIDATING, Ordering::Relaxed);
 		} else {
-			entry.loading = true;
+			status.set(CacheEntryStatus::LOADING, Ordering::Relaxed);
 		}
 	}
 }
 
-pub fn launch_refresh<T, F, R>(entry: &mut CacheEntry<F, R>, inner: &Arc<SWRInner<F, R>>, slot: CacheSlot<F>, refresh_interval: Duration)
+pub fn launch_refresh<T, F, R>(entry: &mut CacheEntry<F, R>, inner: &Arc<SWRInner<F, R>>, slot: CacheSlot, refresh_interval: Duration)
 where
 	T: DeserializeOwned + Send + Sync + 'static,
 	F: Fetcher,
@@ -147,9 +148,9 @@ where
 		let mut states = inner.cache.states();
 		states.mutate(slot, |state| {
 			let options = state.options.read();
-			if (options.refresh_when_unfocused || inner.hook.focused())
-				&& state.alive.load(Ordering::Acquire)
-				&& throttle(state.last_request_time.as_ref(), options.throttle.as_ref())
+			if (options.revalidate_flags.get(RevalidateFlags::WHEN_UNFOCUSED) || inner.hook.focused())
+				&& state.status().get(CacheEntryStatus::ALIVE, Ordering::Acquire)
+				&& throttle(state.last_request_time(Ordering::Acquire), options.throttle())
 			{
 				drop(options);
 
@@ -161,7 +162,7 @@ where
 			}
 
 			// We did not launch a fetch, so we have to launch the next refresh task ourselves.
-			if let Some(refresh_interval) = options.refresh_interval {
+			if let Some(refresh_interval) = options.refresh_interval() {
 				drop(options);
 				launch_refresh::<T, F, R>(state, &inner, slot, refresh_interval);
 			}
@@ -169,7 +170,7 @@ where
 	});
 }
 
-pub fn launch_retry<T, F, R>(entry: &mut CacheEntry<F, R>, inner: &Arc<SWRInner<F, R>>, slot: CacheSlot<F>, retry_interval: Duration)
+pub fn launch_retry<T, F, R>(entry: &mut CacheEntry<F, R>, inner: &Arc<SWRInner<F, R>>, slot: CacheSlot, retry_interval: Duration)
 where
 	T: DeserializeOwned + Send + Sync + 'static,
 	F: Fetcher,
@@ -181,12 +182,13 @@ where
 
 		let mut states = inner.cache.states();
 		states.mutate(slot, |state| {
-			if state.error.is_none() || !state.alive.load(Ordering::Acquire) {
+			let status = state.status().load(Ordering::Acquire);
+			if (status & CacheEntryStatus::HAS_ERROR == 0) || (status & CacheEntryStatus::ALIVE == 0) {
 				return;
 			}
 
 			let options = state.options.read();
-			if throttle(state.last_request_time.as_ref(), options.throttle.as_ref()) {
+			if throttle(state.last_request_time(Ordering::Acquire), options.throttle()) {
 				drop(options);
 
 				launch_fetch::<T, F, R>(state, &inner, slot, TaskStartMode::Soft, RevalidateIntent::RETRY_ON_ERROR);

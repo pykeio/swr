@@ -6,11 +6,11 @@ use std::{
 use serde::de::DeserializeOwned;
 
 use crate::{
-	SWRInner,
+	CacheEntryStatus, SWRInner,
 	cache::{CacheSlot, StateAccessor},
 	error::Error,
 	fetcher::Fetcher,
-	options::{MutateOptions, Options},
+	options::{MutateOptions, Options, RevalidateFlags},
 	revalidate::{RevalidateIntent, launch_fetch},
 	runtime::{DefaultRuntime, Runtime},
 	util::TaskStartMode
@@ -20,8 +20,8 @@ use crate::{
 ///
 /// The cache entry will not be garbage collected for as long as the slot is held.
 pub struct Persisted<T: Send + Sync + 'static, F: Fetcher, R: Runtime = DefaultRuntime> {
-	slot: CacheSlot<F>,
-	options: Option<Options<T, F>>,
+	slot: CacheSlot,
+	options: Option<Options<F::Response<T>>>,
 	inner: Arc<SWRInner<F, R>>
 }
 
@@ -31,11 +31,11 @@ where
 	F: Fetcher,
 	R: Runtime
 {
-	pub(crate) fn new(swr: &Arc<SWRInner<F, R>>, slot: CacheSlot<F>, options: Option<Options<T, F>>) -> Self {
+	pub(crate) fn new(swr: &Arc<SWRInner<F, R>>, slot: CacheSlot, options: Option<Options<F::Response<T>>>) -> Self {
 		{
 			let states = swr.cache.states();
 			if let Some(state) = states.get(slot) {
-				state.persisted_instances.fetch_add(1, Ordering::Relaxed);
+				state.strong_count.fetch_add(1, Ordering::Relaxed);
 				if let Some(options) = options.as_ref() {
 					state.options.write().update_from(options);
 				}
@@ -78,9 +78,10 @@ where
 		let Some(state) = states.get(self.slot) else {
 			return FetchResult::new_empty(self.slot, Arc::downgrade(&self.inner));
 		};
-		let was_alive = state.alive.load(Ordering::Acquire);
+		let status = state.status().load(Ordering::Acquire);
+		let was_alive = status & CacheEntryStatus::ALIVE != 0;
 
-		let mut error = state.error.as_ref().map(|e| Error::Fetcher(Arc::clone(e)));
+		let mut error = state.error().map(|e| Error::Fetcher(Arc::clone(e)));
 		let data = match state.data::<T>() {
 			Some(Ok(data)) => Some(data),
 			Some(Err(e)) => {
@@ -89,39 +90,45 @@ where
 			}
 			None => self.options.as_ref().and_then(|o| o.fallback.clone())
 		};
-		let (mut loading, mut validating) = (state.loading, state.validating);
+		let (mut loading, mut validating) = (status & CacheEntryStatus::LOADING != 0, status & CacheEntryStatus::VALIDATING != 0);
 
 		if update {
+			let intent = state.revalidate_intent();
 			let options = state.options.read();
 
-			if self.inner.hook.was_focus_triggered()
-				&& options.revalidate_on_focus
-				&& state.last_draw_time.load(Ordering::Acquire).elapsed() >= options.focus_throttle_interval
-			{
-				state.revalidate_intent.add(RevalidateIntent::APPLICATION_FOCUSED);
+			if self.inner.hook.was_focus_triggered() && options.revalidate_flags.get(RevalidateFlags::ON_FOCUS) {
+				let throttled = match options.focus_throttle_interval() {
+					Some(throttle) => state.last_draw_time(Ordering::Acquire).elapsed() < throttle,
+					None => false
+				};
+				if !throttled {
+					intent.add(RevalidateIntent::APPLICATION_FOCUSED);
+				}
 			}
 
 			if !was_alive {
-				if (options.fetch_on_first_use && data.is_none())
+				if (options.revalidate_flags.get(RevalidateFlags::ON_FIRST_USE) && data.is_none())
 					// fetch task aborted before it could finish. instead of having the key be forever stuck in the
 					// loading state, restart the initial fetch
-					|| (state.loading && state.fetch_task.is_finished())
+					|| (loading && state.fetch_task.is_finished())
 				{
-					state.revalidate_intent.add(RevalidateIntent::FIRST_USAGE);
+					intent.add(RevalidateIntent::FIRST_USAGE);
 				} else {
 					// TODO: configurable
-					state.revalidate_intent.add(RevalidateIntent::STALE);
+					intent.add(RevalidateIntent::STALE);
 				}
 			}
 
 			state.mark_used();
 
-			let intent = state.revalidate_intent.take();
+			let intent = intent.take();
 			if intent != 0 {
 				drop((state, options));
 				states.mutate(self.slot, |state| {
 					launch_fetch::<T, F, R>(state, &self.inner, self.slot, TaskStartMode::Soft, intent);
-					(loading, validating) = (state.loading, state.validating);
+
+					let status = state.status().load(Ordering::Relaxed);
+					(loading, validating) = (status & CacheEntryStatus::LOADING != 0, status & CacheEntryStatus::VALIDATING != 0);
 				});
 			}
 		}
@@ -153,7 +160,7 @@ where
 	/// `Task`][`runtime::Task`] which may be awaited on (depending on the exact choice of [`Runtime`]).
 	///
 	/// [`MutateOptions`] also allows for more control over how the mutation occurs.
-	pub fn mutate_with<U, M, E, Fut>(&self, options: MutateOptions<F, T, U>, mutator: M) -> R::Task<Result<U, E>>
+	pub fn mutate_with<U, M, E, Fut>(&self, options: MutateOptions<F::Response<T>, U>, mutator: M) -> R::Task<Result<U, E>>
 	where
 		U: Send,
 		M: FnOnce(Option<Arc<F::Response<T>>>, &F) -> Fut + Send + 'static,
@@ -171,7 +178,7 @@ impl<T: Send + Sync + 'static, F: Fetcher, R: Runtime> Drop for Persisted<T, F, 
 		let Some(state) = states.get(self.slot) else {
 			return;
 		};
-		state.persisted_instances.fetch_sub(1, Ordering::Release);
+		state.strong_count.fetch_sub(1, Ordering::Release);
 	}
 }
 
@@ -181,12 +188,12 @@ pub struct FetchResult<T: Send + Sync + 'static, F: Fetcher, R: Runtime = Defaul
 	pub error: Option<Error<F>>,
 	pub loading: bool,
 	pub validating: bool,
-	pub(crate) slot: CacheSlot<F>,
-	pub(crate) inner: Weak<SWRInner<F, R>>
+	slot: CacheSlot,
+	inner: Weak<SWRInner<F, R>>
 }
 
 impl<T: Send + Sync + 'static, F: Fetcher, R: Runtime> FetchResult<T, F, R> {
-	pub(crate) fn new_empty(slot: CacheSlot<F>, inner: Weak<SWRInner<F, R>>) -> Self {
+	pub(crate) fn new_empty(slot: CacheSlot, inner: Weak<SWRInner<F, R>>) -> Self {
 		FetchResult {
 			data: None,
 			error: None,
@@ -227,7 +234,7 @@ impl<T: Send + Sync + 'static, F: Fetcher, R: Runtime> FetchResult<T, F, R> {
 	/// `Task`][`runtime::Task`] which may be awaited on (depending on the exact choice of [`Runtime`]).
 	///
 	/// [`MutateOptions`] also allows for more control over how the mutation occurs.
-	pub fn mutate_with<U, M, E, Fut>(&self, options: MutateOptions<F, T, U>, mutator: M) -> Option<R::Task<Result<U, E>>>
+	pub fn mutate_with<U, M, E, Fut>(&self, options: MutateOptions<F::Response<T>, U>, mutator: M) -> Option<R::Task<Result<U, E>>>
 	where
 		U: Send,
 		M: FnOnce(Option<Arc<F::Response<T>>>, &F) -> Fut + Send + 'static,

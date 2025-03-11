@@ -1,9 +1,4 @@
-use std::{
-	fmt,
-	future::Future,
-	sync::atomic::{AtomicU64, Ordering},
-	time::Duration
-};
+use std::{future::Future, sync::atomic::Ordering, time::Duration};
 
 // Use `tokio`'s `Instant` wrapper in testing since we can 'advance' time with `tokio::time::advance`
 #[cfg(test)]
@@ -15,52 +10,6 @@ pub type Instant = std::time::Instant;
 pub use tokio::time::{advance, pause};
 
 use crate::runtime::{Runtime, Task};
-
-/// A version of [`Instant`] supporting atomic operations.
-pub struct AtomicInstant {
-	base: Instant,
-	// store offset since (unchanging) base instant in nanoseconds; 64 bits holds an offset of ~584 years
-	offset_nanos: AtomicU64
-}
-
-impl AtomicInstant {
-	#[inline]
-	pub fn new(base: Instant) -> AtomicInstant {
-		AtomicInstant {
-			base,
-			offset_nanos: AtomicU64::new(0)
-		}
-	}
-
-	#[inline]
-	pub fn now() -> AtomicInstant {
-		AtomicInstant::new(Instant::now())
-	}
-
-	pub fn load(&self, order: Ordering) -> Instant {
-		let offset_nanos = self.offset_nanos.load(order);
-		let secs = offset_nanos / 1_000_000_000;
-		let subsec_nanos = (offset_nanos % 1_000_000_000) as u32;
-		self.base + Duration::new(secs, subsec_nanos)
-	}
-
-	pub fn store(&self, value: Instant, order: Ordering) {
-		let offset = value - self.base;
-		let offset_nanos = offset.as_secs() * 1_000_000_000 + u64::from(offset.subsec_nanos());
-		self.offset_nanos.store(offset_nanos, order);
-	}
-
-	#[inline]
-	pub fn store_now(&self, order: Ordering) {
-		self.store(Instant::now(), order);
-	}
-}
-
-impl fmt::Debug for AtomicInstant {
-	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-		self.load(Ordering::Relaxed).fmt(f)
-	}
-}
 
 pub struct TaskSlot<R: Runtime> {
 	runtime: R,
@@ -121,44 +70,56 @@ impl<R: Runtime> TaskSlot<R> {
 }
 
 /// Returns `true` if the time elapsed since `prev_time` exceeds the `throttle_time`.
-pub fn throttle(prev_time: Option<&Instant>, throttle_time: Option<&Duration>) -> bool {
+pub fn throttle(prev_time: Option<Instant>, throttle_time: Option<Duration>) -> bool {
 	match (prev_time, throttle_time) {
-		(Some(prev_time), Some(throttle_time)) => prev_time.elapsed() >= *throttle_time,
+		(Some(prev_time), Some(throttle_time)) => prev_time.elapsed() >= throttle_time,
 		_ => true
 	}
 }
 
+pub(crate) trait AtomicBitwise {
+	type Base: Copy;
+
+	fn bits_get(&self, bits: Self::Base, ordering: Ordering) -> bool;
+	fn bits_set(&self, bits: Self::Base, ordering: Ordering) -> bool;
+	fn bits_clear(&self, bits: Self::Base, ordering: Ordering) -> bool;
+}
+
+macro_rules! impl_atomic_bitwise {
+	($($atomic_ty:ty => $base_ty:ty),*) => {
+		$(
+			impl AtomicBitwise for $atomic_ty {
+				type Base = $base_ty;
+
+				fn bits_get(&self, bits: Self::Base, ordering: Ordering) -> bool {
+					(self.load(ordering) & bits) != 0
+				}
+				fn bits_set(&self, bits: Self::Base, ordering: Ordering) -> bool {
+					(self.fetch_or(bits, ordering) & bits) != 0
+				}
+				fn bits_clear(&self, bits: Self::Base, ordering: Ordering) -> bool {
+					(self.fetch_and(!bits, ordering) & bits) != 0
+				}
+			}
+		)*
+	}
+}
+
+impl_atomic_bitwise! {
+	std::sync::atomic::AtomicU8 => u8
+}
+
 #[cfg(test)]
 mod tests {
-	use std::{
-		sync::{
-			Arc,
-			atomic::{AtomicBool, Ordering}
-		},
-		time::Duration
+	use std::sync::{
+		Arc,
+		atomic::{AtomicBool, Ordering}
 	};
 
 	use tokio::task::yield_now;
 
-	use super::{AtomicInstant, Instant, TaskSlot, TaskStartMode};
+	use super::{TaskSlot, TaskStartMode};
 	use crate::runtime::Tokio;
-
-	#[test]
-	fn test_atomic_instant() {
-		let instant = Arc::new(AtomicInstant::now());
-		let mut threads = vec![];
-		for _ in 0..4 {
-			let instant = Arc::clone(&instant);
-			threads.push(std::thread::spawn(move || {
-				instant.store(instant.load(Ordering::SeqCst) + Duration::from_millis(42), Ordering::SeqCst);
-			}));
-		}
-		for thread in threads {
-			thread.join().unwrap();
-		}
-
-		assert!(instant.load(Ordering::Relaxed) >= Instant::now() - Duration::from_millis(42 * 4));
-	}
 
 	#[tokio::test]
 	async fn task_start_soft() {

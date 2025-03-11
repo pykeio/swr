@@ -1,6 +1,8 @@
-use std::{num::NonZeroU32, sync::Arc, time::Duration};
-
-use crate::Fetcher;
+use std::{
+	num::{NonZeroU8, NonZeroU32},
+	sync::Arc,
+	time::Duration
+};
 
 /// # Merging behavior
 /// When a key is retrieved multiple times using [`Options`], the actual options used by the cache entry will be
@@ -18,19 +20,19 @@ use crate::Fetcher;
 /// application is focused. The code that requested **Options A** will have the fallback, but the code that requested
 /// **Options B** will not.
 #[derive(Clone, Debug)]
-pub struct Options<T: Send + Sync + 'static, F: Fetcher> {
+pub struct Options<T: Send + Sync + 'static> {
 	/// Initial data to return until the cache is populated by a fetch.
-	pub fallback: Option<Arc<F::Response<T>>>,
+	pub fallback: Option<Arc<T>>,
 	/// Whether or not to perform a fetch when this key is used for the first time.
 	pub fetch_on_first_use: bool,
 	/// The length of time it takes after this key falls out of use for its entry to be garbage collected.
-	pub garbage_collect_timeout: Duration,
+	pub garbage_collect_timeout: Option<Duration>,
 	/// Whether or not to perform revalidation on this key when the application becomes focused.
 	///
 	/// Focus-triggered revalidations will be throttled according to [`Options::focus_throttle_interval`].
 	pub revalidate_on_focus: bool,
 	/// The amount of time to throttle revalidations between focus events.
-	pub focus_throttle_interval: Duration,
+	pub focus_throttle_interval: Option<Duration>,
 	/// An optional interval at which to refresh data.
 	///
 	/// If [`Options::refresh_when_unfocused`] is `false` (the default), interval-based refreshes will only occur
@@ -46,29 +48,29 @@ pub struct Options<T: Send + Sync + 'static, F: Fetcher> {
 	/// An optional interval at which to retry fetches if an error occurs.
 	pub error_retry_interval: Option<Duration>,
 	/// The maximum amount of times to retry fetching if an error occurs.
-	pub error_retry_count: Option<NonZeroU32>,
+	pub error_retry_count: Option<NonZeroU8>,
 	/// An optional amount of time to throttle between requests.
 	pub throttle: Option<Duration>
 }
 
-impl<T: Send + Sync + 'static, F: Fetcher> Default for Options<T, F> {
+impl<T: Send + Sync + 'static> Default for Options<T> {
 	fn default() -> Self {
 		Self {
 			fallback: None,
 			fetch_on_first_use: true,
-			garbage_collect_timeout: Duration::from_secs(600),
+			garbage_collect_timeout: Some(Duration::from_secs(600)),
 			revalidate_on_focus: true,
-			focus_throttle_interval: Duration::from_secs(5),
+			focus_throttle_interval: Some(Duration::from_secs(5)),
 			refresh_interval: None,
 			refresh_when_unfocused: false,
 			error_retry_interval: Some(Duration::from_secs(5)),
-			error_retry_count: Some(NonZeroU32::new(5).unwrap()),
+			error_retry_count: Some(NonZeroU8::new(5).unwrap()),
 			throttle: Some(Duration::from_secs(2))
 		}
 	}
 }
 
-impl<T: Send + Sync + 'static, F: Fetcher> Options<T, F> {
+impl<T: Send + Sync + 'static> Options<T> {
 	/// Default [`Options`] for resources which are expected to never update throughout the duration of the
 	/// application.
 	///
@@ -78,41 +80,121 @@ impl<T: Send + Sync + 'static, F: Fetcher> Options<T, F> {
 	pub fn immutable() -> Self {
 		Self {
 			revalidate_on_focus: false,
-			garbage_collect_timeout: Duration::from_secs(u64::MAX),
+			garbage_collect_timeout: None,
 			..Options::default()
 		}
 	}
+}
 
-	pub(crate) fn update_from<U: Send + Sync + 'static>(&mut self, other: &Options<U, F>) {
-		self.fetch_on_first_use |= other.fetch_on_first_use;
-		self.garbage_collect_timeout = self.garbage_collect_timeout.min(other.garbage_collect_timeout);
-		self.revalidate_on_focus |= other.revalidate_on_focus;
-		self.focus_throttle_interval = self.focus_throttle_interval.min(self.focus_throttle_interval);
-		self.refresh_interval = merge_min(self.refresh_interval.as_ref(), other.refresh_interval.as_ref());
-		self.refresh_when_unfocused |= other.refresh_when_unfocused;
-		self.error_retry_interval = merge_min(self.error_retry_interval.as_ref(), other.error_retry_interval.as_ref());
-		self.error_retry_count = merge_min(self.error_retry_count.as_ref(), other.error_retry_count.as_ref());
-		self.throttle = merge_min(self.throttle.as_ref(), other.throttle.as_ref());
+#[derive(Debug, Default)]
+pub(crate) struct RevalidateFlags(u8);
+
+impl RevalidateFlags {
+	pub const ON_FIRST_USE: u8 = 1 << 0;
+	pub const ON_FOCUS: u8 = 1 << 1;
+	pub const WHEN_UNFOCUSED: u8 = 1 << 2;
+
+	pub fn get(&self, bits: u8) -> bool {
+		(self.0 & bits) != 0
+	}
+	pub fn set(&mut self, bits: u8) {
+		self.0 |= bits;
 	}
 }
 
-fn merge_min<T: Copy + Ord>(a: Option<&T>, b: Option<&T>) -> Option<T> {
+pub(crate) struct StoredOptions {
+	pub revalidate_flags: RevalidateFlags,
+	pub error_retry_count: Option<NonZeroU8>,
+	// `Duration` is 16 bytes and we definitely don't require sub-millisecond precision
+	garbage_collect_timeout_ms: Option<NonZeroU32>,
+	focus_throttle_interval_ms: Option<NonZeroU32>,
+	refresh_interval_ms: Option<NonZeroU32>,
+	error_retry_interval_ms: Option<NonZeroU32>,
+	throttle_ms: Option<NonZeroU32>
+}
+
+impl Default for StoredOptions {
+	fn default() -> Self {
+		let mut options = StoredOptions {
+			revalidate_flags: RevalidateFlags(0),
+			error_retry_count: None,
+			garbage_collect_timeout_ms: None,
+			focus_throttle_interval_ms: None,
+			refresh_interval_ms: None,
+			error_retry_interval_ms: None,
+			throttle_ms: None
+		};
+		// Inherit our options from the default values for `Options`
+		options.update_from_inner(&Options::default());
+		options
+	}
+}
+
+impl StoredOptions {
+	pub(crate) fn garbage_collect_timeout(&self) -> Option<Duration> {
+		self.garbage_collect_timeout_ms.map(|d| Duration::from_millis(d.get() as _))
+	}
+	pub(crate) fn focus_throttle_interval(&self) -> Option<Duration> {
+		self.focus_throttle_interval_ms.map(|d| Duration::from_millis(d.get() as _))
+	}
+	pub(crate) fn refresh_interval(&self) -> Option<Duration> {
+		self.refresh_interval_ms.map(|d| Duration::from_millis(d.get() as _))
+	}
+	pub(crate) fn error_retry_interval(&self) -> Option<Duration> {
+		self.error_retry_interval_ms.map(|d| Duration::from_millis(d.get() as _))
+	}
+	pub(crate) fn throttle(&self) -> Option<Duration> {
+		self.throttle_ms.map(|d| Duration::from_millis(d.get() as _))
+	}
+
+	#[inline(always)]
+	pub(crate) fn update_from<T: Send + Sync + 'static>(&mut self, options: &Options<T>) {
+		// Save a bit on codegen by not specializing `update_from` for every variant of `T`.
+		// transmuting from Options<T> to Options<()> is safe because the fallback field which uses T is an Arc (always usize
+		// regardless of T), and we don't touch it
+		self.update_from_inner(unsafe { std::mem::transmute::<&Options<T>, &Options<()>>(options) });
+	}
+
+	fn update_from_inner(&mut self, options: &Options<()>) {
+		if options.fetch_on_first_use {
+			self.revalidate_flags.set(RevalidateFlags::ON_FIRST_USE);
+		}
+		self.garbage_collect_timeout_ms = merge_min(self.garbage_collect_timeout_ms, duration_as_optional_millis(&options.garbage_collect_timeout));
+		if options.fetch_on_first_use {
+			self.revalidate_flags.set(RevalidateFlags::ON_FOCUS);
+		}
+		self.focus_throttle_interval_ms = merge_min(self.focus_throttle_interval_ms, duration_as_optional_millis(&options.focus_throttle_interval));
+		self.refresh_interval_ms = merge_min(self.refresh_interval_ms, duration_as_optional_millis(&options.refresh_interval));
+		if options.refresh_when_unfocused {
+			self.revalidate_flags.set(RevalidateFlags::WHEN_UNFOCUSED);
+		}
+		self.error_retry_interval_ms = merge_min(self.error_retry_interval_ms, duration_as_optional_millis(&options.error_retry_interval));
+		self.error_retry_count = merge_min(self.error_retry_count, options.error_retry_count);
+		self.throttle_ms = merge_min(self.throttle_ms, duration_as_optional_millis(&options.throttle));
+	}
+}
+
+fn duration_as_optional_millis(a: &Option<Duration>) -> Option<NonZeroU32> {
+	a.and_then(|d| NonZeroU32::new(d.as_millis() as u32))
+}
+
+fn merge_min<T: Ord>(a: Option<T>, b: Option<T>) -> Option<T> {
 	match (a, b) {
-		(Some(a), Some(b)) => Some(*a.min(b)),
-		(Some(a), None) => Some(*a),
-		(None, Some(b)) => Some(*b),
+		(Some(a), Some(b)) => Some(a.min(b)),
+		(Some(a), None) => Some(a),
+		(None, Some(b)) => Some(b),
 		(None, None) => None
 	}
 }
 
-pub struct MutateOptions<F: Fetcher, T: Send + Sync + 'static, U = T> {
-	pub optimistic_data: Option<Arc<F::Response<T>>>,
+pub struct MutateOptions<T: Send + Sync + 'static, U = T> {
+	pub optimistic_data: Option<Arc<T>>,
 	pub rollback_on_error: bool,
 	pub revalidate: bool,
-	pub populator: Box<dyn Fn(&U) -> Arc<F::Response<T>> + Send>
+	pub populator: Box<dyn Fn(&U) -> Arc<T> + Send>
 }
 
-impl<F: Fetcher, T: Send + Sync + 'static> Default for MutateOptions<F, T, Arc<F::Response<T>>> {
+impl<T: Send + Sync + 'static> Default for MutateOptions<T, Arc<T>> {
 	fn default() -> Self {
 		Self {
 			optimistic_data: None,
@@ -123,8 +205,8 @@ impl<F: Fetcher, T: Send + Sync + 'static> Default for MutateOptions<F, T, Arc<F
 	}
 }
 
-impl<F: Fetcher, T: Send + Sync + 'static, U> MutateOptions<F, T, U> {
-	pub fn with_populator<V>(self, populator: impl Fn(&V) -> Arc<F::Response<T>> + Send + 'static) -> MutateOptions<F, T, V> {
+impl<T: Send + Sync + 'static, U> MutateOptions<T, U> {
+	pub fn with_populator<V>(self, populator: impl Fn(&V) -> Arc<T> + Send + 'static) -> MutateOptions<T, V> {
 		MutateOptions {
 			optimistic_data: self.optimistic_data,
 			rollback_on_error: self.rollback_on_error,
