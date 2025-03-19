@@ -345,12 +345,7 @@ impl<F: Fetcher, R: Runtime> SWR<F, R> {
 	/// `Task`][`runtime::Task`] which may be awaited on (depending on the exact choice of [`Runtime`]).
 	///
 	/// [`MutateOptions`] also allows for more control over how the mutation occurs.
-	pub fn mutate_with<T, U, K, M, E, Fut>(
-		self: &Arc<Self>,
-		key: &K,
-		options: MutateOptions<F::Response<T>, U>,
-		mutator: M
-	) -> R::Task<std::result::Result<U, E>>
+	pub fn mutate_with<T, U, K, M, E, Fut>(&self, key: &K, options: MutateOptions<F::Response<T>, U>, mutator: M) -> R::Task<std::result::Result<U, E>>
 	where
 		T: Send + Sync + 'static,
 		U: Send,
