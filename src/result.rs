@@ -125,7 +125,17 @@ where
 			if intent != 0 {
 				drop((state, options));
 				states.mutate(self.slot, |state| {
-					launch_fetch::<T, F, R>(state, &self.inner, self.slot, TaskStartMode::Soft, intent);
+					launch_fetch::<T, F, R>(
+						state,
+						&self.inner,
+						self.slot,
+						if intent & RevalidateIntent::MANUALLY_TRIGGERED != 0 {
+							TaskStartMode::Abort
+						} else {
+							TaskStartMode::Soft
+						},
+						intent
+					);
 
 					let status = state.status().load(Ordering::Relaxed);
 					(loading, validating) = (status & CacheEntryStatus::LOADING != 0, status & CacheEntryStatus::VALIDATING != 0);
