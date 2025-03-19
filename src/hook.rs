@@ -59,6 +59,12 @@ mod mock {
 			std::mem::replace(&mut self.0.lock().wants_redraw, false)
 		}
 
+		pub fn within<R, F: FnOnce() -> R>(&self, f: F) -> R {
+			let res = f();
+			self.end_frame();
+			res
+		}
+
 		pub fn end_frame(&self) {
 			let inner = self.0.lock();
 			if let Some(cb) = inner.end_frame_cb.as_ref() {

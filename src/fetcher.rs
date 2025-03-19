@@ -169,3 +169,107 @@ pub trait Fetcher: Send + Sync + 'static {
 	/// Fetches the resource using the given key, deserializing the response body as type `T`.
 	fn fetch<T: DeserializeOwned + Send + Sync + 'static>(&self, key: &Self::Key) -> impl Future<Output = Result<Self::Response<T>, Self::Error>> + Send;
 }
+
+#[cfg(test)]
+pub(crate) mod mock {
+	use std::{
+		fmt,
+		marker::PhantomData,
+		sync::{
+			Arc,
+			atomic::{AtomicUsize, Ordering}
+		},
+		time::Duration
+	};
+
+	use tokio::time::sleep;
+
+	#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
+	pub enum Key {
+		Basic,
+		Delayed(Duration),
+		AlwaysError,
+		ErrorNTimes(usize)
+	}
+
+	impl From<&Key> for Key {
+		fn from(value: &Key) -> Self {
+			*value
+		}
+	}
+
+	#[derive(Debug, Default)]
+	pub struct Error;
+
+	impl fmt::Display for Error {
+		fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+			f.write_str("error")
+		}
+	}
+
+	impl std::error::Error for Error {}
+
+	#[derive(Default)]
+	struct FetcherInner {
+		fetch_count: AtomicUsize,
+		error_count: AtomicUsize
+	}
+
+	pub struct Fetcher<E = Error>(Arc<FetcherInner>, PhantomData<E>);
+
+	impl<E> Default for Fetcher<E> {
+		fn default() -> Self {
+			Fetcher(Arc::default(), PhantomData)
+		}
+	}
+
+	impl<E> Clone for Fetcher<E> {
+		fn clone(&self) -> Self {
+			Fetcher(Arc::clone(&self.0), PhantomData)
+		}
+	}
+
+	impl Fetcher<Error> {
+		pub fn new() -> Self {
+			Fetcher(Arc::default(), PhantomData)
+		}
+	}
+
+	impl<E> Fetcher<E> {
+		pub fn fetch_count(&self) -> usize {
+			self.0.fetch_count.load(Ordering::Acquire)
+		}
+
+		pub fn reset(&self) {
+			self.0.fetch_count.store(0, Ordering::Release);
+			self.0.error_count.store(0, Ordering::Release);
+		}
+	}
+
+	impl<E: std::error::Error + Default + Sync + Send + 'static> super::Fetcher for Fetcher<E> {
+		type Key = Key;
+		type Error = E;
+		type Response<T: Send + Sync + 'static> = T;
+
+		async fn fetch<T: serde::de::DeserializeOwned + Send + Sync + 'static>(&self, key: &Self::Key) -> Result<Self::Response<T>, Self::Error> {
+			self.0.fetch_count.fetch_add(1, Ordering::AcqRel);
+
+			match key {
+				Key::Basic => serde_json::from_str("42").map_err(|_| E::default()),
+				Key::Delayed(delay) => {
+					sleep(*delay).await;
+					serde_json::from_str("42").map_err(|_| E::default())
+				}
+				Key::AlwaysError => Err(E::default()),
+				Key::ErrorNTimes(n) => {
+					let err_count = self.0.error_count.fetch_add(1, Ordering::AcqRel);
+					if err_count == *n {
+						serde_json::from_str("42").map_err(|_| E::default())
+					} else {
+						Err(E::default())
+					}
+				}
+			}
+		}
+	}
+}

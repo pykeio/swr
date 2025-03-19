@@ -64,6 +64,9 @@ pub(crate) mod revalidate;
 pub mod runtime;
 pub(crate) mod util;
 
+#[cfg(test)]
+mod tests;
+
 use self::{
 	cache::{Cache, CacheEntryStatus, CacheSlot},
 	revalidate::RevalidateIntent,
@@ -188,6 +191,11 @@ pub struct SWR<F: Fetcher, R: Runtime = DefaultRuntime> {
 }
 
 impl<F: Fetcher, R: Runtime> SWR<F, R> {
+	#[cfg(test)]
+	pub(crate) fn cache(&self) -> &Cache<F, R> {
+		&self.inner.cache
+	}
+
 	/// Creates a new SWR cache.
 	///
 	/// To use this constructor, the [`Runtime`] (`R`) must implement [`Default`], which is the case if using SWR's

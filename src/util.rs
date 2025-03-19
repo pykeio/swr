@@ -6,9 +6,6 @@ pub type Instant = tokio::time::Instant;
 #[cfg(not(test))]
 pub type Instant = std::time::Instant;
 
-#[cfg(test)]
-pub use tokio::time::{advance, pause};
-
 use crate::runtime::{Runtime, Task};
 
 pub struct TaskSlot<R: Runtime> {
