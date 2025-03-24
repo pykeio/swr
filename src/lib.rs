@@ -312,7 +312,7 @@ impl<F: Fetcher, R: Runtime> SWR<F, R> {
 	where
 		T: DeserializeOwned + Send + Sync + 'static,
 		K: Hash + Eq + ?Sized,
-		F::Key: Borrow<K> + for<'k> From<&'k K>
+		F::Key: Borrow<K>
 	{
 		self.inner
 			.cache
@@ -326,7 +326,7 @@ impl<F: Fetcher, R: Runtime> SWR<F, R> {
 	pub fn revalidate<K>(&self, key: &K)
 	where
 		K: Hash + Eq + ?Sized,
-		F::Key: Borrow<K> + for<'k> From<&'k K>
+		F::Key: Borrow<K>
 	{
 		if let Some(slot) = self.inner.cache.get(key) {
 			self.inner.revalidate(slot);
