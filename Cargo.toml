@@ -20,7 +20,7 @@ parking_lot = { version = "0.12", default-features = false }
 
 smol = { version = "2", optional = true }
 tokio = { version = "1", optional = true, default-features = false, features = [ "time", "rt" ] }
-egui = { version = "0.31", optional = true, default-features = false }
+egui = { version = "0.32", optional = true, default-features = false }
 tracing = { version = "0.1", optional = true, default-features = false }
 
 [features]
@@ -32,9 +32,9 @@ egui = [ "dep:egui" ]
 tracing = [ "dep:tracing" ]
 
 [dev-dependencies]
-egui = { version = "0.31.0", default-features = false }
+egui = { version = "0.32", default-features = false }
 serde = { version = "1.0", features = [ "derive" ] }
-eframe = "0.31.0"
+eframe = "0.32"
 reqwest = { version = "0.12", features = [ "json" ] }
 serde_json = "1.0"
 rmp-serde = "1"
