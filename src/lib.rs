@@ -134,17 +134,19 @@ impl<F: Fetcher, R: Runtime> SWRInner<F, R> {
 	{
 		let inner = Arc::clone(self);
 		self.runtime.spawn(async move {
-			let previous_data = if let Some(optimistic_data) = options.optimistic_data {
+			let previous_data = {
 				let mut states = inner.cache.states();
 				states
 					.mutate(slot, |state| {
-						let old_data = state.insert(optimistic_data);
-						inner.hook.request_redraw();
-						old_data
+						if let Some(optimistic_data) = options.optimistic_data {
+							let old_data = state.insert(optimistic_data);
+							inner.hook.request_redraw();
+							old_data
+						} else {
+							state.data_untyped().cloned()
+						}
 					})
 					.flatten()
-			} else {
-				None
 			};
 
 			let res = mutator(data, &inner.fetcher).await;
@@ -156,7 +158,7 @@ impl<F: Fetcher, R: Runtime> SWRInner<F, R> {
 					state.fetch_task.abort();
 
 					if let Ok(data) = &res {
-						state.insert((options.populator)(data));
+						state.insert((options.populator)(data, previous_data.as_ref().and_then(|c| c.value.downcast_ref())));
 						if options.revalidate {
 							state.revalidate_intent().add(RevalidateIntent::MUTATE);
 						}

@@ -187,11 +187,56 @@ fn merge_min<T: Ord>(a: Option<T>, b: Option<T>) -> Option<T> {
 	}
 }
 
+/// Options used for [`SWR::mutate_with`][crate::SWR::mutate_with].
 pub struct MutateOptions<T: Send + Sync + 'static, U = T> {
+	/// Intermediate data to display while the action is being performed, such as the expected result of the mutation if
+	/// it were to succeed.
+	///
+	/// If provided, the key's data will immediately be replaced with this data. Once the action finishes, its result
+	/// will become the key's data.
+	///
+	/// See [`MutateOptions::rollback_on_error`] to configure whether this should be rolled back to its previous
+	/// value if the action fails.
 	pub optimistic_data: Option<Arc<T>>,
+	/// Whether or not to return the key to the data it had before optimistic data was applied if the action fails.
 	pub rollback_on_error: bool,
+	/// Whether or not the key should be revalidated after the action is complete.
 	pub revalidate: bool,
-	pub populator: Box<dyn Fn(&U) -> Arc<T> + Send>
+	/// A function used to map from the action's result to the actual stored key data.
+	///
+	/// The function accepts a reference to the action's result, and the previous (non-optimistic) data stored in the
+	/// key, if there was any.
+	///
+	/// This can be especially useful if the action returns a partial update of the data, in which case the `populator`
+	/// can merge this data into the original value.
+	///
+	/// ```ignore
+	/// # use std::sync::Arc;
+	/// #[derive(Clone, serde::Deserialize)]
+	/// struct Account {
+	/// 	id: String,
+	/// 	balance: usize
+	/// }
+	///
+	/// struct TransactionResult {
+	/// 	balance: usize
+	/// }
+	///
+	/// fn populate_account_from_transaction(partial: &TransactionResult, old_data: Option<&Account>) -> Arc<Account> {
+	/// 	Arc::new(Account {
+	/// 		balance: partial.balance,
+	/// 		..old_data.unwrap().clone()
+	/// 	})
+	/// }
+	///
+	/// # let hook = swr::hook::MockHook::default();
+	/// # let swr = swr::new_in(Fetcher::new(), swr::runtime::Tokio, hook);
+	/// swr.get::<Account, _>("/accounts/1234").mutate_with(
+	/// 	swr::MutateOptions::default().with_populator(populate_account_from_transaction),
+	/// 	|_data, _fetcher| async move { Ok::<_, usize>(TransactionResult { balance: 42 }) }
+	/// );
+	/// ```
+	pub populator: Box<dyn Fn(&U, Option<&T>) -> Arc<T> + Send>
 }
 
 impl<T: Send + Sync + 'static> Default for MutateOptions<T, Arc<T>> {
@@ -200,13 +245,14 @@ impl<T: Send + Sync + 'static> Default for MutateOptions<T, Arc<T>> {
 			optimistic_data: None,
 			rollback_on_error: true,
 			revalidate: false,
-			populator: Box::new(|x| x.clone())
+			populator: Box::new(|x, _prev| x.clone())
 		}
 	}
 }
 
 impl<T: Send + Sync + 'static, U> MutateOptions<T, U> {
-	pub fn with_populator<V>(self, populator: impl Fn(&V) -> Arc<T> + Send + 'static) -> MutateOptions<T, V> {
+	/// Configures a [populator][MutateOptions::populator] using the builder pattern.
+	pub fn with_populator<V>(self, populator: impl Fn(&V, Option<&T>) -> Arc<T> + Send + 'static) -> MutateOptions<T, V> {
 		MutateOptions {
 			optimistic_data: self.optimistic_data,
 			rollback_on_error: self.rollback_on_error,

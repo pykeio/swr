@@ -101,20 +101,24 @@ impl<F: Fetcher, R: Runtime> CacheEntry<F, R> {
 	}
 
 	pub fn data<T: Send + Sync + 'static>(&self) -> Option<Result<Arc<F::Response<T>>, MismatchedTypeError>> {
+		self.data_untyped().map(|data| match Arc::downcast(data.value.clone()) {
+			Ok(x) => Ok(x),
+			Err(_) => Err(MismatchedTypeError {
+				contained_type: self.data.type_id(),
+				wanted_type: TypeId::of::<T>(),
+
+				#[cfg(debug_assertions)]
+				contained_type_name: data.type_name,
+				#[cfg(debug_assertions)]
+				wanted_type_name: std::any::type_name::<T>()
+			})
+		})
+	}
+
+	pub fn data_untyped(&self) -> Option<&CacheEntryData> {
 		if self.status.get(CacheEntryStatus::HAS_DATA, Ordering::Acquire) {
 			let data = unsafe { self.data.assume_init_ref() };
-			Some(match Arc::downcast(data.value.clone()) {
-				Ok(x) => Ok(x),
-				Err(_) => Err(MismatchedTypeError {
-					contained_type: self.data.type_id(),
-					wanted_type: TypeId::of::<T>(),
-
-					#[cfg(debug_assertions)]
-					contained_type_name: data.type_name,
-					#[cfg(debug_assertions)]
-					wanted_type_name: std::any::type_name::<T>()
-				})
-			})
+			Some(data)
 		} else {
 			None
 		}
@@ -209,6 +213,7 @@ impl<F: Fetcher, R: Runtime> CacheEntry<F, R> {
 	}
 }
 
+#[derive(Clone)]
 pub struct CacheEntryData {
 	pub value: Arc<dyn Any + Send + Sync>,
 	#[cfg(debug_assertions)]
