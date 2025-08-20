@@ -61,10 +61,13 @@ async fn garbage_collection() {
 	let swr = SWR::new_in(Fetcher::new(), Tokio, hook.clone());
 
 	hook.within(|| {
-		let _ = swr.get_with::<usize, _>(&Key::Basic, Options {
-			garbage_collect_timeout: Some(Duration::from_secs(5)),
-			..Options::immutable()
-		});
+		let _ = swr.get_with::<usize, _>(
+			&Key::Basic,
+			Options {
+				garbage_collect_timeout: Some(Duration::from_secs(5)),
+				..Options::immutable()
+			}
+		);
 	});
 
 	inspect_entry(&swr, Key::Basic, |entry| {
@@ -117,10 +120,13 @@ async fn refresh() {
 	let swr = SWR::new_in(fetcher.clone(), Tokio, hook.clone());
 
 	hook.within(|| {
-		swr.get_with::<usize, _>(&Key::Basic, Options {
-			refresh_interval: Some(Duration::from_secs(5)),
-			..Options::immutable()
-		});
+		swr.get_with::<usize, _>(
+			&Key::Basic,
+			Options {
+				refresh_interval: Some(Duration::from_secs(5)),
+				..Options::immutable()
+			}
+		);
 	});
 
 	hook.set_focused(true);
@@ -140,11 +146,14 @@ async fn retry() {
 
 	let key = Key::ErrorNTimes(3);
 	hook.within(|| {
-		swr.get_with::<usize, _>(&key, Options {
-			error_retry_interval: Some(Duration::from_secs(3)),
-			error_retry_count: Some(NonZeroU8::new(3).unwrap()),
-			..Options::immutable()
-		});
+		swr.get_with::<usize, _>(
+			&key,
+			Options {
+				error_retry_interval: Some(Duration::from_secs(3)),
+				error_retry_count: Some(NonZeroU8::new(3).unwrap()),
+				..Options::immutable()
+			}
+		);
 	});
 
 	yield_now().await;
@@ -205,10 +214,13 @@ async fn drop_values() {
 	let fetcher = Fetcher::<ErrorWithDrop>::default();
 	let swr = SWR::new_in(fetcher.clone(), Tokio, hook.clone());
 
-	let persisted = swr.persisted::<DataWithDrop, _>(&Key::AlwaysError, Options {
-		fetch_on_first_use: false,
-		..Default::default()
-	});
+	let persisted = swr.persisted::<DataWithDrop, _>(
+		&Key::AlwaysError,
+		Options {
+			fetch_on_first_use: false,
+			..Default::default()
+		}
+	);
 
 	async fn set(p: &Persisted<DataWithDrop, Fetcher<ErrorWithDrop>, Tokio>, ok: bool) {
 		if ok {
@@ -239,4 +251,25 @@ async fn drop_values() {
 	set(&persisted, true).await;
 	assert!(DATA_DROP_FLAG.load(Ordering::Relaxed));
 	assert!(!ERR_DROP_FLAG.swap(false, Ordering::Relaxed));
+}
+
+#[tokio::test(start_paused = true)]
+async fn mutate() {
+	let hook = MockHook::default();
+	let swr = SWR::new_in(Fetcher::new(), Tokio, hook.clone());
+
+	hook.within(|| {
+		let _ = swr.get_with::<usize, _>(&Key::Basic, Options::immutable());
+	});
+
+	let _ =
+		swr.mutate_with(&Key::Basic, MutateOptions::default().with_populator(|ret, _old| Arc::new(*ret + 1)), |_old, _fetcher| async move {
+			Ok::<_, usize>(47usize)
+		})
+		.await;
+
+	inspect_entry(&swr, Key::Basic, |entry| {
+		assert_eq!(entry.data().unwrap().unwrap(), Arc::new(48usize));
+	})
+	.unwrap();
 }

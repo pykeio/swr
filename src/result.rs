@@ -173,12 +173,11 @@ where
 	pub fn mutate_with<U, M, E, Fut>(&self, options: MutateOptions<F::Response<T>, U>, mutator: M) -> R::Task<Result<U, E>>
 	where
 		U: Send,
-		M: FnOnce(Option<Arc<F::Response<T>>>, &F) -> Fut + Send + 'static,
+		M: FnOnce(Option<&Arc<F::Response<T>>>, &F) -> Fut + Send + 'static,
 		E: Send,
 		Fut: Future<Output = std::result::Result<U, E>> + Send
 	{
-		let data = self.get_shallow().data;
-		self.inner.mutate_with(self.slot, data, options, mutator)
+		self.inner.mutate_with(self.slot, options, mutator)
 	}
 }
 
@@ -247,11 +246,11 @@ impl<T: Send + Sync + 'static, F: Fetcher, R: Runtime> FetchResult<T, F, R> {
 	pub fn mutate_with<U, M, E, Fut>(&self, options: MutateOptions<F::Response<T>, U>, mutator: M) -> Option<R::Task<Result<U, E>>>
 	where
 		U: Send,
-		M: FnOnce(Option<Arc<F::Response<T>>>, &F) -> Fut + Send + 'static,
+		M: FnOnce(Option<&Arc<F::Response<T>>>, &F) -> Fut + Send + 'static,
 		E: Send,
 		Fut: Future<Output = std::result::Result<U, E>> + Send
 	{
 		let inner = self.inner.upgrade()?;
-		Some(inner.mutate_with(self.slot, self.data.clone(), options, mutator))
+		Some(inner.mutate_with(self.slot, options, mutator))
 	}
 }

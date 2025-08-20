@@ -204,8 +204,8 @@ pub struct MutateOptions<T: Send + Sync + 'static, U = T> {
 	pub revalidate: bool,
 	/// A function used to map from the action's result to the actual stored key data.
 	///
-	/// The function accepts a reference to the action's result, and the previous (non-optimistic) data stored in the
-	/// key, if there was any.
+	/// The function accepts a mutable reference to the action's result, and the previous (non-optimistic) data stored
+	/// in the key, if there was any.
 	///
 	/// This can be especially useful if the action returns a partial update of the data, in which case the `populator`
 	/// can merge this data into the original value.
@@ -222,7 +222,7 @@ pub struct MutateOptions<T: Send + Sync + 'static, U = T> {
 	/// 	balance: usize
 	/// }
 	///
-	/// fn populate_account_from_transaction(partial: &TransactionResult, old_data: Option<&Account>) -> Arc<Account> {
+	/// fn populate_account_from_transaction(partial: &mut TransactionResult, old_data: Option<&Arc<Account>>) -> Arc<Account> {
 	/// 	Arc::new(Account {
 	/// 		balance: partial.balance,
 	/// 		..old_data.unwrap().clone()
@@ -236,7 +236,7 @@ pub struct MutateOptions<T: Send + Sync + 'static, U = T> {
 	/// 	|_data, _fetcher| async move { Ok::<_, usize>(TransactionResult { balance: 42 }) }
 	/// );
 	/// ```
-	pub populator: Box<dyn Fn(&U, Option<&T>) -> Arc<T> + Send>
+	pub populator: Box<dyn Fn(&mut U, Option<&Arc<T>>) -> Arc<T> + Send>
 }
 
 impl<T: Send + Sync + 'static> Default for MutateOptions<T, Arc<T>> {
@@ -252,7 +252,7 @@ impl<T: Send + Sync + 'static> Default for MutateOptions<T, Arc<T>> {
 
 impl<T: Send + Sync + 'static, U> MutateOptions<T, U> {
 	/// Configures a [populator][MutateOptions::populator] using the builder pattern.
-	pub fn with_populator<V>(self, populator: impl Fn(&V, Option<&T>) -> Arc<T> + Send + 'static) -> MutateOptions<T, V> {
+	pub fn with_populator<V>(self, populator: impl Fn(&mut V, Option<&Arc<T>>) -> Arc<T> + Send + 'static) -> MutateOptions<T, V> {
 		MutateOptions {
 			optimistic_data: self.optimistic_data,
 			rollback_on_error: self.rollback_on_error,

@@ -121,14 +121,13 @@ impl<F: Fetcher, R: Runtime> SWRInner<F, R> {
 	pub(crate) fn mutate_with<T, U, M, E, Fut>(
 		self: &Arc<Self>,
 		slot: CacheSlot,
-		data: Option<Arc<F::Response<T>>>,
 		options: MutateOptions<F::Response<T>, U>,
 		mutator: M
 	) -> R::Task<std::result::Result<U, E>>
 	where
 		T: Send + Sync + 'static,
 		U: Send,
-		M: FnOnce(Option<Arc<F::Response<T>>>, &F) -> Fut + Send + 'static,
+		M: FnOnce(Option<&Arc<F::Response<T>>>, &F) -> Fut + Send + 'static,
 		E: Send,
 		Fut: Future<Output = std::result::Result<U, E>> + Send
 	{
@@ -149,7 +148,7 @@ impl<F: Fetcher, R: Runtime> SWRInner<F, R> {
 					.flatten()
 			};
 
-			let res = mutator(data, &inner.fetcher).await;
+			let mut res = mutator(previous_data.as_ref().and_then(|c| c.value.downcast_ref()), &inner.fetcher).await;
 
 			{
 				let mut states = inner.cache.states();
@@ -157,7 +156,7 @@ impl<F: Fetcher, R: Runtime> SWRInner<F, R> {
 					// If we're currently in the middle of a fetch, cancel it since it's probably outdated.
 					state.fetch_task.abort();
 
-					if let Ok(data) = &res {
+					if let Ok(data) = &mut res {
 						state.insert((options.populator)(data, previous_data.as_ref().and_then(|c| c.value.downcast_ref())));
 						if options.revalidate {
 							state.revalidate_intent().add(RevalidateIntent::MUTATE);
@@ -361,18 +360,12 @@ impl<F: Fetcher, R: Runtime> SWR<F, R> {
 		U: Send,
 		K: Hash + Eq + ?Sized,
 		F::Key: Borrow<K> + for<'k> From<&'k K>,
-		M: FnOnce(Option<Arc<F::Response<T>>>, &F) -> Fut + Send + 'static,
+		M: FnOnce(Option<&Arc<F::Response<T>>>, &F) -> Fut + Send + 'static,
 		E: Send,
 		Fut: Future<Output = std::result::Result<U, E>> + Send
 	{
 		let slot = self.inner.cache.get_or_create(key);
-		let existing_data = self
-			.inner
-			.cache
-			.states()
-			.get(slot)
-			.and_then(|entry| entry.data::<T>().and_then(std::result::Result::ok));
-		self.inner.mutate_with(slot, existing_data, options, mutator)
+		self.inner.mutate_with(slot, options, mutator)
 	}
 }
 
